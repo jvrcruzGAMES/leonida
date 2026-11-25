@@ -135,6 +135,120 @@ class DecodeTests(unittest.TestCase):
         ins = self.one(asm("f3 0f 1e fa"))      # endbr64 (decoded, no crash)
         self.assertEqual(ins.size, 4)
 
+    def test_vex_vzeroupper(self):
+        # vzeroupper / vzeroall (VEX 0F 77) take no ModRM byte
+        for code, expected_mnem in ((asm("c5 f8 77"), "vzeroupper"), (asm("c5 fc 77"), "vzeroall")):
+            ins = self.one(code)
+            self.assertEqual(ins.mnem, expected_mnem)
+            self.assertEqual(ins.size, 3)
+            self.assertEqual(ins.ops, ())
+
+        # Disassembling vzeroupper; ret must not swallow the ret opcode
+        insns = list(x.disasm(asm("c5 f8 77 c3"), 0x1000))
+        self.assertEqual([(i.mnem, i.size) for i in insns], [("vzeroupper", 3), ("ret", 1)])
+
+    def test_vex_moves(self):
+        # vmovaps xmm0, xmm1
+        ins = self.one(asm("c5 f8 28 c1"))
+        self.assertEqual(ins.mnem, "vmovaps")
+        self.assertEqual(ins.ops, (("x", 0, 16), ("x", 1, 16)))
+        self.assertEqual(ins.size, 4)
+
+        # vmovaps xmm0, [rdi+0x10]
+        ins = self.one(asm("c5 f8 28 47 10"))
+        self.assertEqual(ins.mnem, "vmovaps")
+        self.assertEqual(ins.ops[0], ("x", 0, 16))
+        self.assertEqual(ins.ops[1][0], "m")
+        self.assertEqual(ins.ops[1][1]["base"], 7)
+        self.assertEqual(ins.ops[1][1]["disp"], 16)
+
+        # vmovaps [rdi+0x10], xmm0
+        ins = self.one(asm("c5 f8 29 47 10"))
+        self.assertEqual(ins.mnem, "vmovaps")
+        self.assertEqual(ins.ops[0][0], "m")
+        self.assertEqual(ins.ops[1], ("x", 0, 16))
+
+        # vmovups xmm0, xmm2
+        ins = self.one(asm("c5 f8 10 c2"))
+        self.assertEqual(ins.mnem, "vmovups")
+        self.assertEqual(ins.ops, (("x", 0, 16), ("x", 2, 16)))
+
+    def test_vex_vector_arithmetic_and_logic(self):
+        # vaddps xmm0, xmm1, xmm2
+        ins = self.one(asm("c5 f0 58 c2"))
+        self.assertEqual(ins.mnem, "vaddps")
+        self.assertEqual(ins.ops, (("x", 0, 16), ("x", 1, 16), ("x", 2, 16)))
+
+        # vmulps xmm0, xmm1, xmm2
+        ins = self.one(asm("c5 f0 59 c2"))
+        self.assertEqual(ins.mnem, "vmulps")
+        self.assertEqual(ins.ops, (("x", 0, 16), ("x", 1, 16), ("x", 2, 16)))
+
+        # vxorps xmm0, xmm0, xmm0 (zeroing form)
+        ins = self.one(asm("c5 f8 57 c0"))
+        self.assertEqual(ins.mnem, "vxorps")
+        self.assertEqual(ins.ops, (("x", 0, 16), ("x", 0, 16), ("x", 0, 16)))
+
+        # vandps xmm0, xmm1, xmm2
+        ins = self.one(asm("c5 f0 54 c2"))
+        self.assertEqual(ins.mnem, "vandps")
+
+        # vorps xmm0, xmm1, xmm2
+        ins = self.one(asm("c5 f0 56 c2"))
+        self.assertEqual(ins.mnem, "vorps")
+
+    def test_vex_scalar_arithmetic_and_extended_regs(self):
+        # vmovss xmm0, [rdi] (F3 prefix)
+        ins = self.one(asm("c5 fa 10 07"))
+        self.assertEqual(ins.mnem, "vmovss")
+        self.assertEqual(ins.ops[0], ("x", 0, 16))
+
+        # vaddss xmm0, xmm1, xmm2
+        ins = self.one(asm("c5 f2 58 c2"))
+        self.assertEqual(ins.mnem, "vaddss")
+        self.assertEqual(ins.ops, (("x", 0, 16), ("x", 1, 16), ("x", 2, 16)))
+
+        # 3-byte VEX with extended registers (xmm8): vmovaps xmm0, xmm8
+        ins = self.one(asm("c4 c1 78 28 c0"))
+        self.assertEqual(ins.mnem, "vmovaps")
+        self.assertEqual(ins.ops, (("x", 0, 16), ("x", 8, 16)))
+        self.assertEqual(ins.size, 5)
+
+
+class TranslateTests(unittest.TestCase):
+    def test_translate_vex_vector_function(self):
+        # Function: vmovaps load, vaddps, vmulps, vmovaps store, ret
+        code = asm(
+            "c5 f8 28 07",       # vmovaps xmm0, [rdi]
+            "c5 f0 58 0e",       # vaddps xmm1, xmm0, [rsi]
+            "c5 f0 59 c9",       # vmulps xmm1, xmm1, xmm1
+            "c5 f8 29 0f",       # vmovaps [rdi], xmm1
+            "c3")                # ret
+        tr = x.translate_function(code, 0x140001000)
+        self.assertEqual(tr.stats.get("unhandled"), [])
+        self.assertEqual(len(tr.insns), 5)
+
+    def test_translate_vex_scalar_function(self):
+        # Function: vmovss load, vaddss, vmovss store, ret
+        code = asm(
+            "c5 fa 10 07",       # vmovss xmm0, [rdi]
+            "c5 f2 58 0e",       # vaddss xmm1, xmm0, [rsi]
+            "c5 fa 11 0f",       # vmovss [rdi], xmm1
+            "c3")                # ret
+        tr = x.translate_function(code, 0x140001000)
+        self.assertEqual(tr.stats.get("unhandled"), [])
+        self.assertEqual(len(tr.insns), 4)
+
+    def test_translate_vex_zeroing_and_vzeroupper(self):
+        # Function: vzeroupper, vxorps zeroing, ret
+        code = asm(
+            "c5 f8 77",          # vzeroupper
+            "c5 f8 57 c0",       # vxorps xmm0, xmm0, xmm0
+            "c3")                # ret
+        tr = x.translate_function(code, 0x140001000)
+        self.assertEqual(tr.stats.get("unhandled"), [])
+        self.assertEqual(len(tr.insns), 3)
+
 
 def run(code):
     return x.run_result(code, GUEST_VA)

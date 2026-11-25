@@ -198,6 +198,31 @@ OF[0x6E] = ("movd", "V Ed")
 OF[0x7E] = ("movd", "Ed V")
 
 _VEX_IMM8_MAP1 = {0x70, 0x71, 0x72, 0x73, 0xC2, 0xC4, 0xC5, 0xC6}
+_VEX_NO_MODRM_MAP1 = {0x77}
+
+# VEX Map 1 opcode definitions: op -> pp -> (mnem, opspec)
+# pp: 0=none(ps), 1=66(pd), 2=F3(ss), 3=F2(sd)
+_VEX_MAP1 = {
+    0x10: {0: ("vmovups", "V W"), 1: ("vmovupd", "V W"), 2: ("vmovss", "V H W"), 3: ("vmovsd", "V H W")},
+    0x11: {0: ("vmovups", "W V"), 1: ("vmovupd", "W V"), 2: ("vmovss", "W H V"), 3: ("vmovsd", "W H V")},
+    0x28: {0: ("vmovaps", "V W"), 1: ("vmovapd", "V W")},
+    0x29: {0: ("vmovaps", "W V"), 1: ("vmovapd", "W V")},
+    0x54: {0: ("vandps", "V H W"), 1: ("vandpd", "V H W")},
+    0x55: {0: ("vandnps", "V H W"), 1: ("vandnpd", "V H W")},
+    0x56: {0: ("vorps", "V H W"), 1: ("vorpd", "V H W")},
+    0x57: {0: ("vxorps", "V H W"), 1: ("vxorpd", "V H W")},
+    0x58: {0: ("vaddps", "V H W"), 1: ("vaddpd", "V H W"), 2: ("vaddss", "V H W"), 3: ("vaddsd", "V H W")},
+    0x59: {0: ("vmulps", "V H W"), 1: ("vmulpd", "V H W"), 2: ("vmulss", "V H W"), 3: ("vmulsd", "V H W")},
+    0x5C: {0: ("vsubps", "V H W"), 1: ("vsubpd", "V H W"), 2: ("vsubss", "V H W"), 3: ("vsubsd", "V H W")},
+    0x5E: {0: ("vdivps", "V H W"), 1: ("vdivpd", "V H W"), 2: ("vdivss", "V H W"), 3: ("vdivsd", "V H W")},
+    0x6F: {1: ("vmovdqa", "V W"), 2: ("vmovdqu", "V W")},
+    0x77: {0: ("vzeroupper", "")},
+    0x7F: {1: ("vmovdqa", "W V"), 2: ("vmovdqu", "W V")},
+    0xDB: {1: ("vpand", "V H W")},
+    0xDF: {1: ("vpandn", "V H W")},
+    0xEB: {1: ("vpor", "V H W")},
+    0xEF: {1: ("vpxor", "V H W")},
+}
 
 
 class Insn:
@@ -330,7 +355,7 @@ def _finish(buf, pos, end, ins, start, mnem, opspec, state, addr, opcode_byte):
     rexr, rexx, rexb = state["rexr"], state["rexx"], state["rexb"]
     has_rex, vex = state["has_rex"], state["vex"]
 
-    has_modrm = opspec and any(t[0] in "EGMUW" for t in opspec.split())
+    has_modrm = opspec and any(t[0] in "EGMUWV" for t in opspec.split())
     reg_field, rm_make = 0, None
     if has_modrm:
         reg_field, rm_make, pos, _ = _modrm(buf, pos, end, rexr, rexx, rexb, has_rex)
@@ -342,10 +367,18 @@ def _finish(buf, pos, end, ins, start, mnem, opspec, state, addr, opcode_byte):
             hi8 = s == "b" and not has_rex and 4 <= reg_field <= 7
             ops.append(("r", reg_field - 4 if hi8 else reg_field,
                         _size_of(s, opsize, rexw), hi8))
-        elif t in "EMUW":
+        elif t in "EMU":
             ops.append(rm_make(_size_of(s, opsize, rexw)))
+        elif t == "V":
+            ops.append(("x", reg_field, 16))
         elif t == "H":
-            ops.append(("r", vex["vvvv"] if vex else 0, 16))
+            ops.append(("x", vex["vvvv"] if vex else 0, 16))
+        elif t == "W":
+            rm = rm_make(16)
+            if rm[0] == "r":
+                ops.append(("x", rm[1], 16))
+            else:
+                ops.append(rm)
         elif t == "O":
             r = (opcode_byte & 7) | (rexb << 3)
             hi8 = s == "b" and not has_rex and 4 <= r <= 7
@@ -468,7 +501,7 @@ def _classify(ins, mnem, cc_index, state):
             ins.flags_r = "NZCPA"
     elif mnem == "x87":
         ins.kind = "x87"
-    elif mnem in ("simd", "sse"):
+    elif mnem in ("simd", "sse") or mnem.startswith("v"):
         ins.kind = "simd"
     elif mnem in ("ud1", "ud2", "int3"):
         ins.kind = "trap"
@@ -514,20 +547,22 @@ def decode_one(buf, pos, end, addr):
         if p1 & 0x04:
             vex = {"evex": True, "map": p0 & 0x1F,
                    "r": (~p0 >> 7) & 1, "x": (~p0 >> 6) & 1, "b": (~p0 >> 5) & 1,
-                   "w": (p1 >> 7) & 1, "vvvv": (~p1 >> 3) & 0xF, "pp": p1 & 3}
+                   "w": (p1 >> 7) & 1, "vvvv": (~p1 >> 3) & 0xF, "pp": p1 & 3,
+                   "l": (p2 >> 5) & 3}
             pos += 4
             b0 = buf[pos]
     elif b0 in (0xC4, 0xC5) and pos + 1 < end:
         if b0 == 0xC5:
             b1 = buf[pos + 1]
-            vex = {"evex": False, "map": 1, "r": (~b1 >> 7) & 1, "x": 1, "b": 1,
-                   "w": 0, "vvvv": (~b1 >> 3) & 0xF, "pp": b1 & 3}
+            vex = {"evex": False, "map": 1, "r": (~b1 >> 7) & 1, "x": 0, "b": 0,
+                   "w": 0, "vvvv": (~b1 >> 3) & 0xF, "pp": b1 & 3, "l": (b1 >> 2) & 1}
             pos += 2
         else:
             b1, b2 = buf[pos + 1], buf[pos + 2]
             vex = {"evex": False, "map": b1 & 0x1F, "r": (~b1 >> 7) & 1,
                    "x": (~b1 >> 6) & 1, "b": (~b1 >> 5) & 1,
-                   "w": (b2 >> 7) & 1, "vvvv": (~b2 >> 3) & 0xF, "pp": b2 & 3}
+                   "w": (b2 >> 7) & 1, "vvvv": (~b2 >> 3) & 0xF, "pp": b2 & 3,
+                   "l": (b2 >> 2) & 1}
             pos += 3
         b0 = buf[pos]
 
@@ -540,7 +575,11 @@ def decode_one(buf, pos, end, addr):
         if pos >= end:
             raise DecodeError("truncated after rex")
         b0 = buf[pos]
-    rexw, rexr, rexx, rexb = (rex >> 3) & 1, (rex >> 2) & 1, (rex >> 1) & 1, rex & 1
+    if vex is not None:
+        rexw, rexr, rexx, rexb = vex["w"], vex["r"], vex["x"], vex["b"]
+        has_rex = True
+    else:
+        rexw, rexr, rexx, rexb = (rex >> 3) & 1, (rex >> 2) & 1, (rex >> 1) & 1, rex & 1
 
     ins.rep, ins.lock, ins.seg, ins.opsize = rep, lock, seg, opsize
     ins.rexw, ins.has_rex = rexw, has_rex
@@ -556,16 +595,28 @@ def decode_one(buf, pos, end, addr):
     if vex is not None:
         omap = vex["map"]
         if omap == 1:
-            spec = ("simd", "V W Ib") if op in _VEX_IMM8_MAP1 else ("simd", "V W")
+            pp = vex["pp"]
+            info = _VEX_MAP1.get(op, {}).get(pp)
+            if info:
+                mnem, opspec = info
+                if op == 0x77 and vex.get("l"):
+                    mnem = "vzeroall"
+            elif op in _VEX_NO_MODRM_MAP1:
+                mnem = "vzeroupper" if not vex.get("l") else "vzeroall"
+                opspec = ""
+            elif op in _VEX_IMM8_MAP1:
+                mnem, opspec = f"v{op:02x}", "V W Ib"
+            else:
+                mnem, opspec = f"v{op:02x}", "V W"
         elif omap == 2:
-            spec = ("simd", "V W")
+            mnem, opspec = f"v{op:02x}", "V W"
         elif omap == 3:
-            spec = ("simd", "V W Ib")
+            mnem, opspec = f"v{op:02x}", "V W Ib"
         else:
             ins.unknown, ins.mnem = True, f"vexmap{omap}"
             ins.size = pos - start
             return ins
-        return _finish(buf, pos, end, ins, start, f"v{op:02x}", spec[1], state, addr, opcode_byte)
+        return _finish(buf, pos, end, ins, start, mnem, opspec, state, addr, opcode_byte)
 
     if op == 0x0F:
         if pos >= end:
@@ -1098,6 +1149,109 @@ class Asm:
         assert -256 <= off <= 255
         self.emit(base | (off & 0x1FF) << 12 | rn << 5 | rt)
 
+    # 128-bit vector loads/stores
+    def ldr_q(self, vt, rn, off=0):
+        assert 0 <= off < 4096 * 16 and off % 16 == 0, f"ldr_q off {off}"
+        self.emit(0x3DC00000 | (off // 16) << 10 | rn << 5 | vt)
+
+    def str_q(self, vt, rn, off=0):
+        assert 0 <= off < 4096 * 16 and off % 16 == 0, f"str_q off {off}"
+        self.emit(0x3D800000 | (off // 16) << 10 | rn << 5 | vt)
+
+    def ldur_q(self, vt, rn, off=0):
+        assert -256 <= off <= 255, f"ldur_q off {off}"
+        self.emit(0x3CC00000 | (off & 0x1FF) << 12 | rn << 5 | vt)
+
+    def stur_q(self, vt, rn, off=0):
+        assert -256 <= off <= 255, f"stur_q off {off}"
+        self.emit(0x3C800000 | (off & 0x1FF) << 12 | rn << 5 | vt)
+
+    # 128-bit vector arithmetic
+    def fadd_4s(self, vd, vn, vm):
+        self.emit(0x4E20D400 | vm << 16 | vn << 5 | vd)
+
+    def fsub_4s(self, vd, vn, vm):
+        self.emit(0x4EA0D400 | vm << 16 | vn << 5 | vd)
+
+    def fmul_4s(self, vd, vn, vm):
+        self.emit(0x6E20DC00 | vm << 16 | vn << 5 | vd)
+
+    def fdiv_4s(self, vd, vn, vm):
+        self.emit(0x6E20FC00 | vm << 16 | vn << 5 | vd)
+
+    def fadd_2d(self, vd, vn, vm):
+        self.emit(0x4E60D400 | vm << 16 | vn << 5 | vd)
+
+    def fsub_2d(self, vd, vn, vm):
+        self.emit(0x4EE0D400 | vm << 16 | vn << 5 | vd)
+
+    def fmul_2d(self, vd, vn, vm):
+        self.emit(0x6E60DC00 | vm << 16 | vn << 5 | vd)
+
+    def fdiv_2d(self, vd, vn, vm):
+        self.emit(0x6E60FC00 | vm << 16 | vn << 5 | vd)
+
+    # 128-bit vector bitwise
+    def eor_16b(self, vd, vn, vm):
+        self.emit(0x6E201C00 | vm << 16 | vn << 5 | vd)
+
+    def orr_16b(self, vd, vn, vm):
+        self.emit(0x4EA01C00 | vm << 16 | vn << 5 | vd)
+
+    def and_16b(self, vd, vn, vm):
+        self.emit(0x4E201C00 | vm << 16 | vn << 5 | vd)
+
+    def bic_16b(self, vd, vn, vm):
+        self.emit(0x4E601C00 | vm << 16 | vn << 5 | vd)
+
+    # scalar float loads/stores and inserts
+    def ldr_s(self, vt, rn, off=0):
+        assert 0 <= off < 4096 * 4 and off % 4 == 0, f"ldr_s off {off}"
+        self.emit(0xBD400000 | (off // 4) << 10 | rn << 5 | vt)
+
+    def str_s(self, vt, rn, off=0):
+        assert 0 <= off < 4096 * 4 and off % 4 == 0, f"str_s off {off}"
+        self.emit(0xBD000000 | (off // 4) << 10 | rn << 5 | vt)
+
+    def ldr_d(self, vt, rn, off=0):
+        assert 0 <= off < 4096 * 8 and off % 8 == 0, f"ldr_d off {off}"
+        self.emit(0xFD400000 | (off // 8) << 10 | rn << 5 | vt)
+
+    def str_d(self, vt, rn, off=0):
+        assert 0 <= off < 4096 * 8 and off % 8 == 0, f"str_d off {off}"
+        self.emit(0xFD000000 | (off // 8) << 10 | rn << 5 | vt)
+
+    def ins_s0(self, vd, vn):
+        self.emit(0x6E040400 | vn << 5 | vd)
+
+    def ins_d0(self, vd, vn):
+        self.emit(0x6E080400 | vn << 5 | vd)
+
+    # scalar float arithmetic
+    def fadd_s(self, vd, vn, vm):
+        self.emit(0x1E202800 | vm << 16 | vn << 5 | vd)
+
+    def fsub_s(self, vd, vn, vm):
+        self.emit(0x1E203800 | vm << 16 | vn << 5 | vd)
+
+    def fmul_s(self, vd, vn, vm):
+        self.emit(0x1E200800 | vm << 16 | vn << 5 | vd)
+
+    def fdiv_s(self, vd, vn, vm):
+        self.emit(0x1E201800 | vm << 16 | vn << 5 | vd)
+
+    def fadd_d(self, vd, vn, vm):
+        self.emit(0x1E602800 | vm << 16 | vn << 5 | vd)
+
+    def fsub_d(self, vd, vn, vm):
+        self.emit(0x1E603800 | vm << 16 | vn << 5 | vd)
+
+    def fmul_d(self, vd, vn, vm):
+        self.emit(0x1E600800 | vm << 16 | vn << 5 | vd)
+
+    def fdiv_d(self, vd, vn, vm):
+        self.emit(0x1E601800 | vm << 16 | vn << 5 | vd)
+
     # conditional select
     def _csel(self, base, rd, rn, rm, cond, sf):
         self.emit((base if sf else base - 0x80000000) | rm << 16 | COND[cond] << 12 | rn << 5 | rd)
@@ -1144,6 +1298,8 @@ class Asm:
 # guest reg -> host reg. Scratch: x0-x4, x16(ADDR_T), x17(GTMP), x30(LINK). x28=ctx. x18 free.
 GMAP = {0: 19, 1: 20, 2: 21, 3: 22, 4: 23, 5: 24, 6: 25, 7: 26,
         8: 27, 9: 9, 10: 10, 11: 11, 12: 12, 13: 13, 14: 14, 15: 15}
+XMAP = {i: i for i in range(16)}
+VTMP0, VTMP1 = 16, 17
 CTX_REG = 28
 ADDR_T = 16
 GTMP = 17
@@ -1370,6 +1526,204 @@ class FunctionTranslator:
             a.str(src, ADDR_T, 0, size=self._op_size(op))
         else:
             raise UnhandledInsn(ins, f"store {op}")
+
+    def _load_simd(self, ins, op, vtmp):
+        a = self.asm
+        if op[0] == "x":
+            return XMAP[op[1]]
+        elif op[0] == "m":
+            self._mem_addr(op[1], ADDR_T)
+            a.ldr_q(vtmp, ADDR_T, 0)
+            return vtmp
+        else:
+            raise UnhandledInsn(ins, f"simd operand {op}")
+
+    def _emit_simd(self, ins):
+        a = self.asm
+        m = ins.mnem
+        if m in ("vzeroupper", "vzeroall"):
+            return
+
+        if m in ("vmovaps", "vmovups", "vmovapd", "vmovupd", "vmovdqa", "vmovdqu"):
+            dst, src = ins.ops[0], ins.ops[1]
+            if dst[0] == "x":
+                if src[0] == "x":
+                    if XMAP[dst[1]] != XMAP[src[1]]:
+                        a.orr_16b(XMAP[dst[1]], XMAP[src[1]], XMAP[src[1]])
+                elif src[0] == "m":
+                    self._mem_addr(src[1], ADDR_T)
+                    a.ldr_q(XMAP[dst[1]], ADDR_T, 0)
+                else:
+                    raise UnhandledInsn(ins, f"{m} src {src}")
+            elif dst[0] == "m":
+                if src[0] == "x":
+                    self._mem_addr(dst[1], ADDR_T)
+                    a.str_q(XMAP[src[1]], ADDR_T, 0)
+                else:
+                    raise UnhandledInsn(ins, f"{m} src {src}")
+            else:
+                raise UnhandledInsn(ins, f"{m} dst {dst}")
+            return
+
+        if m in ("vxorps", "vxorpd", "vpxor"):
+            dst, src1, src2 = ins.ops[0], ins.ops[1], ins.ops[2]
+            vd = XMAP[dst[1]]
+            if src1 == src2 and src1[0] == "x":
+                a.eor_16b(vd, vd, vd)
+            else:
+                s1 = self._load_simd(ins, src1, VTMP0)
+                s2 = self._load_simd(ins, src2, VTMP1)
+                a.eor_16b(vd, s1, s2)
+            return
+
+        if m in ("vandps", "vandpd", "vpand"):
+            dst, src1, src2 = ins.ops[0], ins.ops[1], ins.ops[2]
+            vd = XMAP[dst[1]]
+            s1 = self._load_simd(ins, src1, VTMP0)
+            s2 = self._load_simd(ins, src2, VTMP1)
+            a.and_16b(vd, s1, s2)
+            return
+
+        if m in ("vorps", "vorpd", "vpor"):
+            dst, src1, src2 = ins.ops[0], ins.ops[1], ins.ops[2]
+            vd = XMAP[dst[1]]
+            s1 = self._load_simd(ins, src1, VTMP0)
+            s2 = self._load_simd(ins, src2, VTMP1)
+            a.orr_16b(vd, s1, s2)
+            return
+
+        if m in ("vandnps", "vandnpd", "vpandn"):
+            dst, src1, src2 = ins.ops[0], ins.ops[1], ins.ops[2]
+            vd = XMAP[dst[1]]
+            s1 = self._load_simd(ins, src1, VTMP0)
+            s2 = self._load_simd(ins, src2, VTMP1)
+            a.bic_16b(vd, s2, s1)
+            return
+
+        if m in ("vaddps", "vaddpd"):
+            dst, src1, src2 = ins.ops[0], ins.ops[1], ins.ops[2]
+            vd = XMAP[dst[1]]
+            s1 = self._load_simd(ins, src1, VTMP0)
+            s2 = self._load_simd(ins, src2, VTMP1)
+            if m == "vaddpd":
+                a.fadd_2d(vd, s1, s2)
+            else:
+                a.fadd_4s(vd, s1, s2)
+            return
+
+        if m in ("vsubps", "vsubpd"):
+            dst, src1, src2 = ins.ops[0], ins.ops[1], ins.ops[2]
+            vd = XMAP[dst[1]]
+            s1 = self._load_simd(ins, src1, VTMP0)
+            s2 = self._load_simd(ins, src2, VTMP1)
+            if m == "vsubpd":
+                a.fsub_2d(vd, s1, s2)
+            else:
+                a.fsub_4s(vd, s1, s2)
+            return
+
+        if m in ("vmulps", "vmulpd"):
+            dst, src1, src2 = ins.ops[0], ins.ops[1], ins.ops[2]
+            vd = XMAP[dst[1]]
+            s1 = self._load_simd(ins, src1, VTMP0)
+            s2 = self._load_simd(ins, src2, VTMP1)
+            if m == "vmulpd":
+                a.fmul_2d(vd, s1, s2)
+            else:
+                a.fmul_4s(vd, s1, s2)
+            return
+
+        if m in ("vdivps", "vdivpd"):
+            dst, src1, src2 = ins.ops[0], ins.ops[1], ins.ops[2]
+            vd = XMAP[dst[1]]
+            s1 = self._load_simd(ins, src1, VTMP0)
+            s2 = self._load_simd(ins, src2, VTMP1)
+            if m == "vdivpd":
+                a.fdiv_2d(vd, s1, s2)
+            else:
+                a.fdiv_4s(vd, s1, s2)
+            return
+
+        if m in ("vmovss", "vmovsd"):
+            is_d = m == "vmovsd"
+            if len(ins.ops) == 3:
+                op0, op1, op2 = ins.ops
+                if op0[0] == "m":
+                    self._mem_addr(op0[1], ADDR_T)
+                    if is_d:
+                        a.str_d(XMAP[op2[1]], ADDR_T, 0)
+                    else:
+                        a.str_s(XMAP[op2[1]], ADDR_T, 0)
+                elif op2[0] == "m":
+                    self._mem_addr(op2[1], ADDR_T)
+                    if is_d:
+                        a.ldr_d(XMAP[op0[1]], ADDR_T, 0)
+                    else:
+                        a.ldr_s(XMAP[op0[1]], ADDR_T, 0)
+                else:
+                    vd = XMAP[op0[1]]
+                    v1 = XMAP[op1[1]]
+                    v2 = XMAP[op2[1]]
+                    if vd != v1:
+                        a.orr_16b(vd, v1, v1)
+                    if is_d:
+                        a.ins_d0(vd, v2)
+                    else:
+                        a.ins_s0(vd, v2)
+            elif len(ins.ops) == 2:
+                dst, src = ins.ops
+                if dst[0] == "m":
+                    self._mem_addr(dst[1], ADDR_T)
+                    if is_d:
+                        a.str_d(XMAP[src[1]], ADDR_T, 0)
+                    else:
+                        a.str_s(XMAP[src[1]], ADDR_T, 0)
+                elif src[0] == "m":
+                    self._mem_addr(src[1], ADDR_T)
+                    if is_d:
+                        a.ldr_d(XMAP[dst[1]], ADDR_T, 0)
+                    else:
+                        a.ldr_s(XMAP[dst[1]], ADDR_T, 0)
+                elif dst[0] == "x" and src[0] == "x":
+                    vd = XMAP[dst[1]]
+                    vs = XMAP[src[1]]
+                    if is_d:
+                        a.ins_d0(vd, vs)
+                    else:
+                        a.ins_s0(vd, vs)
+            return
+
+        if m in ("vaddss", "vsubss", "vmulss", "vdivss", "vaddsd", "vsubsd", "vmulsd", "vdivsd"):
+            is_d = m.endswith("sd")
+            dst, src1, src2 = ins.ops
+            vd = XMAP[dst[1]]
+            v1 = XMAP[src1[1]]
+            if src2[0] == "m":
+                self._mem_addr(src2[1], ADDR_T)
+                if is_d:
+                    a.ldr_d(VTMP1, ADDR_T, 0)
+                else:
+                    a.ldr_s(VTMP1, ADDR_T, 0)
+                s2 = VTMP1
+            else:
+                s2 = XMAP[src2[1]]
+            if "add" in m:
+                (a.fadd_d if is_d else a.fadd_s)(VTMP0, v1, s2)
+            elif "sub" in m:
+                (a.fsub_d if is_d else a.fsub_s)(VTMP0, v1, s2)
+            elif "mul" in m:
+                (a.fmul_d if is_d else a.fmul_s)(VTMP0, v1, s2)
+            elif "div" in m:
+                (a.fdiv_d if is_d else a.fdiv_s)(VTMP0, v1, s2)
+            if vd != v1:
+                a.orr_16b(vd, v1, v1)
+            if is_d:
+                a.ins_d0(vd, VTMP0)
+            else:
+                a.ins_s0(vd, VTMP0)
+            return
+
+        raise UnhandledInsn(ins, f"simd {m}")
 
     def _mem_addr(self, m, rd):
         a = self.asm
@@ -2218,6 +2572,8 @@ class FunctionTranslator:
             raise UnhandledInsn(ins, "std/DF=1")
         elif k == "nop":
             pass
+        elif k == "simd":
+            self._emit_simd(ins)
         else:
             raise UnhandledInsn(ins, f"kind {k}")
 
@@ -2529,6 +2885,10 @@ def build_test_kernel(code, guest_va, rw_base=KERNEL_RW, rx_base=KERNEL_BASE):
 
     def stub_bytes(entry_va):
         s = Asm()
+        s.emit(0xD5381040)                 # mrs x0, CPACR_EL1
+        s.emit(0xB26C0400)                 # orr x0, x0, #(3 << 20)  (FPEN = 0b11)
+        s.emit(0xD5181040)                 # msr CPACR_EL1, x0
+        s.emit(0xD5033FDF)                 # isb
         s.li(CTX_REG, rw_base)
         s.li(GMAP[4], rw_base + 0x8000)
         s.str(31, GMAP[4], 0)              # guest stack top: sentinel ret -> pc 0
